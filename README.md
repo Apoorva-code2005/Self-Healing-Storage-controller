@@ -123,7 +123,13 @@ curl -X POST "http://127.0.0.1:8000/recovery/node-1?mode=priority"
 curl "http://127.0.0.1:8000/recovery/status?limit=50"
 ```
 
-### 6. Teardown Storage Services
+### 6. Launch the Observability Dashboard (Streamlit)
+```bash
+streamlit run dashboard/app.py
+```
+
+### 7. Teardown Storage Services
 ```bash
 docker compose down -v
 ```
+
