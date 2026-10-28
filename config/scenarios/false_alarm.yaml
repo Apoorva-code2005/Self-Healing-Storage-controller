@@ -1,0 +1,16 @@
+scenario_id: "false_alarm_01"
+name: "False Alarm Transient Latency Spike"
+scenario_type: "synthetic"
+prediction_outcome: "false_alarm"
+lead_time_s: 10
+seed: 100
+target_node_id: "node-2"
+faults:
+  - tick: 2
+    type: "latency_spike"
+    node_id: "node-2"
+    latency_ms: 140.0
+  - tick: 4
+    type: "error_rate_increase"
+    node_id: "node-2"
+    error_rate: 0.08

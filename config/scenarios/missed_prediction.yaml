@@ -1,0 +1,11 @@
+scenario_id: "missed_01"
+name: "Missed Prediction Sudden Hard Failure"
+scenario_type: "synthetic"
+prediction_outcome: "missed"
+lead_time_s: 0
+seed: 2026
+target_node_id: "node-2"
+faults:
+  - tick: 4
+    type: "node_unavailable"
+    node_id: "node-2"

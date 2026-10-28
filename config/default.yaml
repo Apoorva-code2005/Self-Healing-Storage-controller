@@ -1,0 +1,46 @@
+app:
+  name: "self-healing-storage"
+  version: "0.1.0"
+  env: "development"
+
+nodes:
+  - id: "node-1"
+    name: "Node 1"
+    endpoint_url: "http://127.0.0.1:9001"
+    access_key: "minioadmin"
+    secret_key: "minioadmin"
+    region: "us-east-1"
+    virtual_capacity_bytes: 10737418240  # 10 GiB virtual quota per Section 7.4
+  - id: "node-2"
+    name: "Node 2"
+    endpoint_url: "http://127.0.0.1:9002"
+    access_key: "minioadmin"
+    secret_key: "minioadmin"
+    region: "us-east-1"
+    virtual_capacity_bytes: 10737418240  # 10 GiB virtual quota per Section 7.4
+  - id: "node-3"
+    name: "Node 3"
+    endpoint_url: "http://127.0.0.1:9003"
+    access_key: "minioadmin"
+    secret_key: "minioadmin"
+    region: "us-east-1"
+    virtual_capacity_bytes: 10737418240  # 10 GiB virtual quota per Section 7.4
+
+policy:
+  default_replica_count: 2
+  reserve_margin_ratio: 0.10  # 10% of node virtual capacity per PRD Section 24
+  reserve_margin_bytes: 1073741824  # 1 GiB (10% of 10 GiB node virtual quota)
+  max_destination_risk: 0.5
+  max_destination_load: 0.8
+  gamma: 0.0
+
+weights:
+  w1_criticality: 0.40
+  w2_access_frequency: 0.20
+  w3_node_risk: 0.25
+  w4_redundancy: 0.15
+
+thresholds:
+  risk_threshold: 0.7
+  latency_threshold_ms: 50.0
+  error_rate_threshold: 0.05

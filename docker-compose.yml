@@ -1,0 +1,50 @@
+services:
+  minio-1:
+    image: docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z
+    container_name: minio-1
+    command: server /data --console-address ":9091"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "127.0.0.1:9001:9000"
+      - "127.0.0.1:9091:9091"
+    volumes:
+      - minio_data_1:/data
+    restart: unless-stopped
+
+  minio-2:
+    image: docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z
+    container_name: minio-2
+    command: server /data --console-address ":9092"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "127.0.0.1:9002:9000"
+      - "127.0.0.1:9092:9092"
+    volumes:
+      - minio_data_2:/data
+    restart: unless-stopped
+
+  minio-3:
+    image: docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z
+    container_name: minio-3
+    command: server /data --console-address ":9093"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "127.0.0.1:9003:9000"
+      - "127.0.0.1:9093:9093"
+    volumes:
+      - minio_data_3:/data
+    restart: unless-stopped
+
+volumes:
+  minio_data_1:
+    name: minio_data_1
+  minio_data_2:
+    name: minio_data_2
+  minio_data_3:
+    name: minio_data_3

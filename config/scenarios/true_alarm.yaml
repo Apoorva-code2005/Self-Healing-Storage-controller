@@ -1,0 +1,19 @@
+scenario_id: "true_alarm_01"
+name: "True Alarm Latency and Error Degradation"
+scenario_type: "synthetic"
+prediction_outcome: "true_alarm"
+lead_time_s: 5
+seed: 42
+target_node_id: "node-2"
+faults:
+  - tick: 2
+    type: "latency_spike"
+    node_id: "node-2"
+    latency_ms: 120.0
+  - tick: 3
+    type: "error_rate_increase"
+    node_id: "node-2"
+    error_rate: 0.10
+  - tick: 7
+    type: "node_unavailable"
+    node_id: "node-2"
