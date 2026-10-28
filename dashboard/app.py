@@ -5,12 +5,21 @@ Observability, Monitoring, and Failure Injection Control UI.
 """
 from __future__ import annotations
 
+from pathlib import Path
+import sys
 import time
 from typing import Any, Dict, List
 import pandas as pd
 import streamlit as st
 
-from dashboard.api_client import ControllerClient, format_bytes, format_risk_level
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+try:
+    from dashboard.api_client import ControllerClient, format_bytes, format_risk_level
+except ModuleNotFoundError:
+    from api_client import ControllerClient, format_bytes, format_risk_level
 
 st.set_page_config(
     page_title="Self-Healing Storage Controller",
