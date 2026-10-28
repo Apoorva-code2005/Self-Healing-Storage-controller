@@ -3,11 +3,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
 from app.config import AppConfig, ThresholdsConfig
 from app.db.repository import record_prediction, record_telemetry
+from app.services.predictor import get_default_predictor
 from app.storage.adapter import StorageAdapter
 
 logger = logging.getLogger("self_healing_storage.telemetry")
@@ -179,9 +181,24 @@ def ingest_telemetry_record(
 
     record_telemetry(conn, record)
 
-    risk_score, anomaly_flag, explanation = evaluate_baseline_risk(
-        record, config.thresholds
+    # Evaluate risk using Random Forest predictor for replayed/SMART telemetry, or baseline
+    is_replayed = (record.get("source_type") == "replayed") or any(
+        k.startswith("smart_") for k in record
     )
+    if is_replayed:
+        predictor = get_default_predictor()
+        risk_score, anomaly_flag, explanation = predictor.predict_risk(
+            record, config.thresholds
+        )
+        model_name = "random_forest"
+        target_horizon = "7d"
+    else:
+        risk_score, anomaly_flag, explanation = evaluate_baseline_risk(
+            record, config.thresholds
+        )
+        model_name = "baseline_threshold"
+        target_horizon = "10s"
+
     status = compute_node_status(
         bool(record.get("reachable", True)),
         is_fenced,
@@ -195,9 +212,9 @@ def ingest_telemetry_record(
         "node_id": record["node_id"],
         "timestamp_utc": record["timestamp_utc"],
         "risk_score": risk_score,
-        "model_name": "baseline_threshold",
+        "model_name": model_name,
         "model_version": "1.0.0",
-        "target_horizon": "10s",
+        "target_horizon": target_horizon,
         "anomaly_flag": anomaly_flag,
         "explanation": explanation,
     }
@@ -230,3 +247,59 @@ def ingest_telemetry_record(
         "prediction": pred,
         "node_status": status,
     }
+
+
+def load_replay_pool(pool_path: Optional[str | Path] = None) -> Dict[str, Any]:
+    """Loads held-out replay pool dictionary from data/replay_pool.json."""
+    path = (
+        Path(pool_path)
+        if pool_path
+        else Path(__file__).resolve().parent.parent.parent / "data" / "replay_pool.json"
+    )
+    if path.is_file():
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def emit_replayed_telemetry(
+    conn: Any,
+    node_id: str,
+    drive_record: Dict[str, Any],
+    config: AppConfig,
+    timestamp_utc: Optional[str] = None,
+    simulated_metrics: Optional[Dict[str, Any]] = None,
+    is_fenced: bool = False,
+) -> Dict[str, Any]:
+    """Emits and scores a replayed SMART record for a node per PRD 10.5.
+
+    Combines historical Backblaze SMART attributes with simulated network metrics.
+    """
+    ts = timestamp_utc or datetime.now(timezone.utc).isoformat()
+    sim = simulated_metrics or {}
+
+    telem = {
+        "telemetry_id": str(uuid.uuid4()),
+        "node_id": node_id,
+        "timestamp_utc": ts,
+        "latency_ms": sim.get("latency_ms", 5.0),
+        "error_rate": sim.get("error_rate", 0.0),
+        "temperature_c": float(drive_record.get("smart_194_raw", 28.0) or 28.0),
+        "capacity_free_bytes": sim.get("capacity_free_bytes", 10_000_000_000),
+        "load_metric": sim.get("load_metric", 0.0),
+        "reachable": sim.get("reachable", True),
+        "source_type": "replayed",
+        "replay_drive_serial": drive_record.get("serial_number"),
+        "replay_source_date": drive_record.get("date"),
+        # SMART attributes for ML predictor scoring
+        "smart_5_raw": drive_record.get("smart_5_raw", 0),
+        "smart_9_raw": drive_record.get("smart_9_raw", 0),
+        "smart_187_raw": drive_record.get("smart_187_raw", 0),
+        "smart_194_raw": drive_record.get("smart_194_raw", 28),
+        "smart_197_raw": drive_record.get("smart_197_raw", 0),
+        "smart_198_raw": drive_record.get("smart_198_raw", 0),
+    }
+
+    result = ingest_telemetry_record(conn, telem, config, is_fenced=is_fenced)
+    result["telemetry"] = telem
+    return result

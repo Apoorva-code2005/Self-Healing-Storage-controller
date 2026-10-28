@@ -1,0 +1,26 @@
+{
+  "model_name": "random_forest",
+  "model_version": "1.0.0",
+  "features": [
+    "smart_5_raw",
+    "smart_9_raw",
+    "smart_187_raw",
+    "smart_194_raw",
+    "smart_197_raw",
+    "smart_198_raw"
+  ],
+  "n_estimators": 50,
+  "max_depth": 8,
+  "train_samples": 740,
+  "test_samples": 255,
+  "precision": 1.0,
+  "recall": 1.0,
+  "f1": 1.0,
+  "false_positive_rate": 0.0,
+  "confusion_matrix": {
+    "true_negatives": 231,
+    "false_positives": 0,
+    "false_negatives": 0,
+    "true_positives": 24
+  }
+}
