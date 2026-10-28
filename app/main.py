@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import email
 from email.policy import default as default_email_policy
 import hashlib
+import logging
 import sqlite3
 from typing import Any, Dict, Generator, List, Optional, Tuple
 import uuid
+
+log = logging.getLogger(__name__)
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
@@ -25,7 +29,12 @@ from app.db import (
     record_download_access,
     run_migrations,
     sync_nodes,
+    create_job,
+    get_job,
+    list_recent_jobs,
 )
+from app.jobs.evacuation import redundancy_status
+from app.jobs.worker import process_next_job, run_worker
 from app.schemas.objects import ObjectListResponse, UploadResponse
 from app.schemas.telemetry import (
     PredictionResponse,
@@ -35,6 +44,7 @@ from app.schemas.telemetry import (
 from app.services.failure_injection import execute_scenario, load_scenario
 from app.services.placement import select_destinations
 from app.services.priority import count_healthy_verified_replicas, rank_objects
+from app.services.scenario_clock import ScenarioClock
 from app.storage.adapter import NodeReachability, StorageAdapter
 
 app_config: AppConfig = load_config()
@@ -157,12 +167,33 @@ def create_app(
     db_conn: sqlite3.Connection | None = None,
 ) -> FastAPI:
     current_cfg = cfg or app_config
+    _clock = ScenarioClock()
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         conn = db_conn or create_connection()
         run_migrations(conn)
         sync_nodes(conn, current_cfg.nodes)
+        _adp = adapter or storage_adapter
+
+        # Phase 6b: Restart Reconciliation
+        from app.jobs.reconciliation import reconcile_on_startup
+        reconcile_on_startup(conn, _adp, _clock, current_cfg)
+
+        app.state.db = conn
+        app.state.adapter = _adp
+        app.state.clock = _clock
+        app.state.config = current_cfg
+        _worker_task = None
+        if current_cfg.app.worker_enabled:
+            _worker_task = asyncio.create_task(run_worker(app.state))
         yield
+        if _worker_task is not None:
+            _worker_task.cancel()
+            try:
+                await _worker_task
+            except asyncio.CancelledError:
+                pass
 
     application = FastAPI(
         title="Self-Healing Storage Controller",
@@ -412,71 +443,262 @@ def create_app(
         return SimulateFailureResponse(**result)
 
     # ------------------------------------------------------------------
+    # POST /recovery/{node_id}  (Phase 6a)
+    # ------------------------------------------------------------------
+    @application.post("/recovery/{node_id}", status_code=202)
+    def trigger_recovery(
+        node_id: str,
+        mode: str = Query(default="priority", description="priority or fifo"),
+        adp: StorageAdapter = Depends(get_adapter),
+        db: sqlite3.Connection = Depends(get_db_session),
+    ) -> Dict[str, Any]:
+        if mode not in ("priority", "fifo"):
+            raise HTTPException(status_code=400, detail=f"Invalid mode '{mode}'. Use 'priority' or 'fifo'.")
+
+        capacities = get_nodes_with_capacity(db)
+        if node_id not in capacities:
+            raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+
+        # Find all objects with a replica on this node
+        cursor = db.execute(
+            """
+            SELECT o.object_id
+            FROM objects o
+            JOIN replicas r ON r.object_id = o.object_id
+            WHERE r.node_id = ?
+            GROUP BY o.object_id
+            ORDER BY MIN(o.created_at) ASC, MIN(o.rowid) ASC
+            """,
+            (node_id,),
+        )
+        object_ids = [row[0] for row in cursor.fetchall()]
+
+        # Objects that already have an active job
+        active_cursor = db.execute(
+            "SELECT DISTINCT object_id FROM migration_jobs WHERE status IN ('queued','running','verifying')"
+        )
+        active_objects = {row[0] for row in active_cursor.fetchall()}
+
+        # Build ranked/fifo list
+        if not object_ids:
+            return {"node_id": node_id, "mode": mode, "jobs": []}
+
+        all_items, _ = list_objects(db, limit=10000, offset=0)
+
+        current_adp = adapter or adp
+        from app.jobs.rereplication import fallback_evacuation_jobs, find_surviving_replicas, is_node_hard_failed
+
+        node_failed = is_node_hard_failed(current_adp, node_id, db)
+        if node_failed:
+            # Fallback active evacuation jobs for this node to re_replicate
+            fallback_evacuation_jobs(db, current_adp, node_id, _clock, current_cfg)
+
+            candidates = []
+            for oid in object_ids:
+                if oid in active_objects:
+                    continue
+                surviving = find_surviving_replicas(db, current_adp, oid, exclude_node_ids={node_id})
+                if not surviving:
+                    from app.jobs.evacuation import _set_object_status
+                    _set_object_status(db, oid, "lost")
+                    log.error("ALERT: Object %s is lost: node %s hard-failed with zero surviving replicas", oid, node_id)
+                else:
+                    candidates.append((oid, surviving[0]["node_id"]))
+
+            if not candidates:
+                return {"node_id": node_id, "mode": mode, "jobs": []}
+
+            cand_oids = {c[0] for c in candidates}
+            obj_map = {o["object_id"]: o for o in all_items if o["object_id"] in cand_oids}
+            cand_sources = {c[0]: c[1] for c in candidates}
+
+            if mode == "priority":
+                all_cap = get_nodes_with_capacity(db)
+                reachabilities = current_adp.check_all_nodes()
+                reachable_map = {r.node_id: r for r in reachabilities}
+                healthy_node_ids = [
+                    nid for nid, cap in all_cap.items()
+                    if reachable_map.get(nid) and reachable_map[nid].reachable
+                    and not reachable_map[nid].fenced
+                    and cap.get("status") == "healthy"
+                ]
+                for obj in obj_map.values():
+                    nc = all_cap.get(cand_sources[obj["object_id"]], {})
+                    obj["_node_risk_score"] = float(nc.get("risk_score", 0.0))
+                w = current_cfg.weights
+                ordered = rank_objects(
+                    list(obj_map.values()),
+                    healthy_node_ids=healthy_node_ids,
+                    w1=w.w1_criticality,
+                    w2=w.w2_access_frequency,
+                    w3=w.w3_node_risk,
+                    w4=w.w4_redundancy,
+                    gamma=current_cfg.policy.gamma,
+                    use_rate=False,
+                )
+            else:
+                ordered = [obj_map[oid] for oid in object_ids if oid in obj_map]
+
+            now_iso = _clock.now_iso()
+            jobs_created = []
+            for obj in ordered:
+                oid = obj["object_id"]
+                priority_score = float(obj.get("priority", 0.0)) if mode == "priority" else 0.0
+                jid = create_job(
+                    db,
+                    job_type="re_replicate",
+                    object_id=oid,
+                    source_node_id=cand_sources[oid],
+                    target_node_id="",
+                    priority_score=priority_score,
+                    now=now_iso,
+                )
+                jobs_created.append({
+                    "job_id": jid,
+                    "object_id": oid,
+                    "priority_score": priority_score,
+                    "status": "queued",
+                })
+            return {"node_id": node_id, "mode": mode, "jobs": jobs_created}
+
+        obj_map = {o["object_id"]: o for o in all_items if o["object_id"] in set(object_ids)}
+
+        if mode == "priority":
+            current_adp = adapter or adp
+            all_cap = get_nodes_with_capacity(db)
+            reachabilities = current_adp.check_all_nodes()
+            reachable_map = {r.node_id: r for r in reachabilities}
+            healthy_node_ids = [
+                nid for nid, cap in all_cap.items()
+                if reachable_map.get(nid) and reachable_map[nid].reachable
+                and not reachable_map[nid].fenced
+                and cap.get("status") == "healthy"
+            ]
+            for obj in obj_map.values():
+                nc = all_cap.get(next(
+                    (r["node_id"] for r in obj.get("replicas", []) if r.get("is_authoritative")),
+                    node_id
+                ), {})
+                obj["_node_risk_score"] = float(nc.get("risk_score", 0.0))
+            w = current_cfg.weights
+            ranked = rank_objects(
+                list(obj_map.values()),
+                healthy_node_ids=healthy_node_ids,
+                w1=w.w1_criticality,
+                w2=w.w2_access_frequency,
+                w3=w.w3_node_risk,
+                w4=w.w4_redundancy,
+                gamma=current_cfg.policy.gamma,
+                use_rate=False,
+            )
+            ordered = ranked
+        else:
+            # fifo: sort by object created_at ascending (preserving creation order)
+            ordered = [obj_map[oid] for oid in object_ids if oid in obj_map]
+
+        now_iso = _clock.now_iso()
+        jobs_created = []
+        for i, obj in enumerate(ordered):
+            oid = obj["object_id"]
+            if oid in active_objects:
+                continue
+            priority_score = float(obj.get("priority", 0.0)) if mode == "priority" else 0.0
+            # Find the best target: any healthy node not currently holding a verified replica
+            all_nodes_list = list(capacities.values())
+            existing_replicas = obj.get("replicas", [])
+            destinations = select_destinations(
+                source_node_id=node_id,
+                object_size_bytes=int(obj["size_bytes"]),
+                existing_replicas=existing_replicas,
+                candidate_nodes=all_nodes_list,
+                max_destination_risk=current_cfg.policy.max_destination_risk,
+                max_destination_load=current_cfg.policy.max_destination_load,
+                reserve_margin_bytes=current_cfg.policy.reserve_margin_bytes,
+                needed=1,
+            )
+            target_node_id = destinations[0]["node_id"] if destinations else ""
+            jid = create_job(
+                db,
+                job_type="evacuate",
+                object_id=oid,
+                source_node_id=node_id,
+                target_node_id=target_node_id,
+                priority_score=priority_score,
+                now=now_iso,
+            )
+            jobs_created.append({
+                "job_id": jid,
+                "object_id": oid,
+                "priority_score": priority_score,
+                "status": "queued",
+            })
+
+        return {"node_id": node_id, "mode": mode, "jobs": jobs_created}
+
+    # ------------------------------------------------------------------
+    # GET /recovery/status  (Phase 6a)
+    # ------------------------------------------------------------------
+    @application.get("/recovery/status")
+    def recovery_status(
+        limit: int = Query(default=50, ge=1, le=200),
+        db: sqlite3.Connection = Depends(get_db_session),
+    ) -> Dict[str, Any]:
+        jobs = list_recent_jobs(db, limit=limit)
+        summary: Dict[str, int] = {}
+        enriched = []
+        for j in jobs:
+            status = j["status"]
+            summary[status] = summary.get(status, 0) + 1
+            r_status = redundancy_status(j["object_id"], db)
+            enriched.append({
+                "job_id": j["job_id"],
+                "object_id": j["object_id"],
+                "status": status,
+                "source_node_id": j["source_node_id"],
+                "target_node_id": j["target_node_id"],
+                "priority_score": j["priority_score"],
+                "bytes_transferred": j["bytes_transferred"],
+                "retries": j["retries"],
+                "verification_result": j["verification_result"],
+                "error_message": j["error_message"],
+                "redundancy_status": r_status,
+            })
+        cursor = db.execute("SELECT object_id FROM objects WHERE status = 'lost'")
+        lost_objects = [row[0] for row in cursor.fetchall()]
+        return {"jobs": enriched, "summary": summary, "lost_objects": lost_objects}
+
+    # ------------------------------------------------------------------
     # GET /priority  (Phase 5 — read-only)
     # ------------------------------------------------------------------
     @application.get("/priority")
     def get_priority(
-        node_id: Optional[str] = Query(
-            default=None,
-            description="Filter objects whose authoritative replica is on this node",
-        ),
-        gamma: float = Query(
-            default=current_cfg.policy.gamma,
-            ge=0.0,
-            le=1.0,
-            description="Size-aware exponent (0 = base score)",
-        ),
-        use_rate: bool = Query(
-            default=False,
-            description="Sort by PriorityRate (size-aware) instead of Priority",
-        ),
+        node_id: Optional[str] = Query(default=None),
+        gamma: float = Query(default=current_cfg.policy.gamma, ge=0.0, le=1.0),
+        use_rate: bool = Query(default=False),
         limit: int = Query(default=50, ge=1, le=100),
         offset: int = Query(default=0, ge=0),
         adp: StorageAdapter = Depends(get_adapter),
         db: sqlite3.Connection = Depends(get_db_session),
     ) -> Dict[str, Any]:
-        """Return objects ranked by configurable priority score.
-
-        Query parameters
-        ----------------
-        node_id   : restrict to objects with an authoritative replica on this node
-        gamma     : size-aware exponent in [0, 1] (0 reproduces base priority)
-        use_rate  : if true, sort by PriorityRate instead of Priority
-        limit/offset: pagination
-        """
         current_adp = adapter or adp
-
-        # Collect node capacity/status info
         capacities = get_nodes_with_capacity(db)
-
-        # Determine healthy node ids from live reachability + DB status
         reachabilities = current_adp.check_all_nodes()
         reachable_map = {r.node_id: r for r in reachabilities}
-        healthy_node_ids = []
-        for nid, cap in capacities.items():
-            r_info = reachable_map.get(nid)
-            reachable = r_info.reachable if r_info else False
-            fenced = r_info.fenced if r_info else False
-            db_status = cap.get("status", "healthy")
-            if reachable and not fenced and db_status == "healthy":
-                healthy_node_ids.append(nid)
-
-        # Load all objects (we need to rank across everything)
+        healthy_node_ids = [
+            nid for nid, cap in capacities.items()
+            if reachable_map.get(nid) and reachable_map[nid].reachable
+            and not reachable_map[nid].fenced
+            and cap.get("status") == "healthy"
+        ]
         all_items, total = list_objects(db, limit=10000, offset=0)
-
-        # Optionally filter to a specific source node
         if node_id:
             if node_id not in capacities:
                 raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
-            filtered = []
-            for obj in all_items:
-                for rep in obj.get("replicas", []):
-                    if rep.get("is_authoritative") and rep["node_id"] == node_id:
-                        filtered.append(obj)
-                        break
-            all_items = filtered
-
-        # Attach node risk score to each object via its authoritative replica's node
+            all_items = [
+                o for o in all_items
+                if any(r.get("is_authoritative") and r["node_id"] == node_id
+                       for r in o.get("replicas", []))
+            ]
         for obj in all_items:
             node_risk = 0.0
             for rep in obj.get("replicas", []):
@@ -485,7 +707,6 @@ def create_app(
                     node_risk = float(cap.get("risk_score", 0.0))
                     break
             obj["_node_risk_score"] = node_risk
-
         w = current_cfg.weights
         ranked = rank_objects(
             all_items,
@@ -497,20 +718,13 @@ def create_app(
             gamma=gamma,
             use_rate=use_rate,
         )
-
         grand_total = len(ranked)
         page = ranked[offset: offset + limit]
-
-        # Strip internal helper key before returning
         for obj in page:
             obj.pop("_node_risk_score", None)
-
         return {
-            "total": grand_total,
-            "limit": limit,
-            "offset": offset,
-            "gamma": gamma,
-            "use_rate": use_rate,
+            "total": grand_total, "limit": limit, "offset": offset,
+            "gamma": gamma, "use_rate": use_rate,
             "weights": {
                 "w1_criticality": w.w1_criticality,
                 "w2_access_frequency": w.w2_access_frequency,

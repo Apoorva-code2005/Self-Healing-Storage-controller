@@ -58,6 +58,7 @@ class AppInfo(BaseModel):
     name: str = "self-healing-storage"
     version: str = "0.1.0"
     env: str = "development"
+    worker_enabled: bool = True  # set False in tests to skip background worker
 
 
 class AppConfig(BaseModel):

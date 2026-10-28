@@ -111,6 +111,18 @@ curl -X POST http://127.0.0.1:8000/simulate-failure \
 curl "http://127.0.0.1:8000/predictions?limit=10"
 ```
 
+#### Trigger Evacuation / Recovery (POST /recovery/{node_id})
+```bash
+# Request recovery evacuation for a node in priority or fifo mode (default: priority)
+curl -X POST "http://127.0.0.1:8000/recovery/node-1?mode=priority"
+```
+
+#### Query Recovery Status (GET /recovery/status)
+```bash
+# Query recent migration jobs and status counts
+curl "http://127.0.0.1:8000/recovery/status?limit=50"
+```
+
 ### 6. Teardown Storage Services
 ```bash
 docker compose down -v

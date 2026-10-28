@@ -85,7 +85,7 @@ def redundancy_status(object_id: str, db: sqlite3.Connection) -> str:
       "lost"                  — zero verified replicas on any reachable node
     """
     obj = get_object(db, object_id)
-    if obj is None:
+    if obj is None or obj.get("status") == "lost":
         return "lost"
 
     nodes = get_nodes_with_capacity(db)
@@ -157,6 +157,8 @@ def _run_job(
     source_node_id: str,
     object_id: str,
 ) -> str:
+    from app.jobs.rereplication import _run_rereplication, is_node_hard_failed
+
     policy = config.policy
     job_id: str = job["job_id"]
 
@@ -168,6 +170,12 @@ def _run_job(
         update_job(db, job_id, status="failed", error_message="Object not found",
                    finished_at=_now_iso(clock))
         return "failed"
+
+    # Check if source node hard-failed before starting copy
+    if is_node_hard_failed(adapter, source_node_id, db):
+        log.warning("Job %s: source %s hard-failed before copy; falling back to re-replication", job_id, source_node_id)
+        update_job(db, job_id, job_type="re_replicate")
+        return _run_rereplication(job, db, adapter, clock, config, source_node_id, object_id)
 
     stored_checksum: str = obj["checksum_sha256"]
     size_bytes: int = int(obj["size_bytes"])
@@ -230,6 +238,10 @@ def _run_job(
             break
         except (ConnectionError, Exception) as exc:
             copy_error = exc
+            if is_node_hard_failed(adapter, source_node_id, db):
+                log.warning("Job %s: source %s hard-failed during copy; falling back to re-replication", job_id, source_node_id)
+                update_job(db, job_id, job_type="re_replicate")
+                return _run_rereplication(job, db, adapter, clock, config, source_node_id, object_id)
             if attempt < MAX_RETRIES:
                 backoff_s = policy.evacuation_backoff_base_s * (2 ** attempt)
                 backoff_log.append(backoff_s)
@@ -243,6 +255,10 @@ def _run_job(
                 break
 
     if copy_error is not None:
+        if is_node_hard_failed(adapter, source_node_id, db):
+            log.warning("Job %s: source %s hard-failed during copy; falling back to re-replication", job_id, source_node_id)
+            update_job(db, job_id, job_type="re_replicate")
+            return _run_rereplication(job, db, adapter, clock, config, source_node_id, object_id)
         msg = f"Copy failed after {retries} retries: {copy_error}"
         log.error("Job %s: %s", job_id, msg)
         update_job(db, job_id, status="failed", error_message=msg,
