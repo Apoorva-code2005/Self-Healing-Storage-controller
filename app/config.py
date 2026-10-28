@@ -24,6 +24,7 @@ class PolicyConfig(BaseModel):
     max_destination_risk: float = 0.5
     max_destination_load: float = 0.8
     gamma: float = 0.0
+    lease_ttl_s: int = 300  # scenario-clock seconds; per PRD Section 7.5
 
 
 class WeightsConfig(BaseModel):

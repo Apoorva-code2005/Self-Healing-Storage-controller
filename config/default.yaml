@@ -33,6 +33,7 @@ policy:
   max_destination_risk: 0.5
   max_destination_load: 0.8
   gamma: 0.0
+  lease_ttl_s: 300  # scenario-clock seconds per PRD Section 7.5
 
 weights:
   w1_criticality: 0.40

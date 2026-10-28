@@ -17,6 +17,15 @@ from app.db.repository import (
     sync_nodes,
     update_node_status,
 )
+from app.db.jobs_repo import (
+    create_job,
+    update_job,
+    get_job,
+    list_recent_jobs,
+    acquire_lease,
+    release_lease,
+    reclaim_expired_leases,
+)
 
 __all__ = [
     "create_connection",
@@ -37,4 +46,13 @@ __all__ = [
     "save_scenario",
     "sync_nodes",
     "update_node_status",
+    # jobs
+    "create_job",
+    "update_job",
+    "get_job",
+    "list_recent_jobs",
+    # leases
+    "acquire_lease",
+    "release_lease",
+    "reclaim_expired_leases",
 ]
