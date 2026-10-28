@@ -34,6 +34,8 @@ policy:
   max_destination_load: 0.8
   gamma: 0.0
   lease_ttl_s: 300  # scenario-clock seconds per PRD Section 7.5
+  bandwidth_bytes_per_s: 10485760  # 10 MiB/s simulated transfer rate
+  evacuation_backoff_base_s: 1.0   # exponential back-off base in scenario seconds
 
 weights:
   w1_criticality: 0.40

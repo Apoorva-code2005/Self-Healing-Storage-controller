@@ -25,6 +25,8 @@ class PolicyConfig(BaseModel):
     max_destination_load: float = 0.8
     gamma: float = 0.0
     lease_ttl_s: int = 300  # scenario-clock seconds; per PRD Section 7.5
+    bandwidth_bytes_per_s: int = 10 * 1024 * 1024  # 10 MiB/s simulated
+    evacuation_backoff_base_s: float = 1.0  # exponential back-off base (1, 2, 4 s)
 
 
 class WeightsConfig(BaseModel):
