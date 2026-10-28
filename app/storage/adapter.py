@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import time
 from typing import Dict, List, Optional, Set
 import boto3
@@ -7,6 +9,8 @@ from botocore.config import Config
 from pydantic import BaseModel, Field
 
 from app.config import NodeConfig
+
+CHUNK_SIZE = 1024 * 1024  # 1 MiB
 
 
 class NodeReachability(BaseModel):
@@ -161,6 +165,57 @@ class StorageAdapter:
         client = self.get_client(node_id)
         client.delete_object(Bucket=bucket, Key=key)
 
+    def stream_sha256(self, node_id: str, key: str, bucket: str = "objects") -> str:
+        """Returns the SHA-256 hex digest of an object by streaming in 1 MiB chunks.
+
+        Never loads the whole object into memory. Raises if the node is unavailable.
+        """
+        client = self.get_client(node_id)
+        resp = client.get_object(Bucket=bucket, Key=key)
+        body = resp["Body"]
+        h = hashlib.sha256()
+        while True:
+            chunk = body.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            h.update(chunk)
+        return h.hexdigest()
+
+    def copy_object(
+        self,
+        source_node_id: str,
+        target_node_id: str,
+        key: str,
+        bucket: str = "objects",
+    ) -> int:
+        """Copies key from source_node to target_node in 1 MiB chunks.
+
+        Returns bytes_copied. Respects fencing on both nodes.
+        The source is never modified or deleted.
+        If the target already holds the key it is overwritten.
+        """
+        # Validate both nodes are reachable before touching anything
+        src_client = self.get_client(source_node_id)  # raises if fenced/unknown
+        self.get_client(target_node_id)               # raises if fenced/unknown
+
+        resp = src_client.get_object(Bucket=bucket, Key=key)
+        body = resp["Body"]
+
+        buf = io.BytesIO()
+        bytes_copied = 0
+        while True:
+            chunk = body.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            buf.write(chunk)
+            bytes_copied += len(chunk)
+
+        self.ensure_bucket(target_node_id, bucket=bucket)
+        tgt_client = self.get_client(target_node_id)
+        buf.seek(0)
+        tgt_client.put_object(Bucket=bucket, Key=key, Body=buf.read())
+        return bytes_copied
+
 
 class InMemoryStorageAdapter(StorageAdapter):
     """In-memory storage adapter for unit testing without Docker or external S3 services."""
@@ -174,6 +229,8 @@ class InMemoryStorageAdapter(StorageAdapter):
         self._latencies: Dict[str, float] = {n.id: 1.0 for n in node_configs}
         self._errors: Dict[str, str] = {}
         self._connect_timeout = 2.0
+        # Test hook: fail after this many bytes when writing to the keyed node
+        self._fail_after_bytes: Dict[str, int] = {}
 
     def set_node_reachability(self, node_id: str, reachable: bool, error: Optional[str] = None) -> None:
         if reachable:
@@ -183,6 +240,24 @@ class InMemoryStorageAdapter(StorageAdapter):
             self._unreachable_nodes.add(node_id)
             if error:
                 self._errors[node_id] = error
+
+    def set_fail_after_bytes(self, node_id: str, after_bytes: int) -> None:
+        """Test hook: cause writes to node_id to fail after after_bytes bytes copied."""
+        self._fail_after_bytes[node_id] = after_bytes
+
+    def clear_fail_after_bytes(self, node_id: str) -> None:
+        self._fail_after_bytes.pop(node_id, None)
+
+    def _check_available(self, node_id: str) -> None:
+        """Raises ConnectionError if node is fenced or unreachable."""
+        if node_id not in self._configs:
+            raise KeyError(f"Unknown node ID: {node_id}")
+        if self.is_fenced(node_id):
+            raise ConnectionError(f"Node '{node_id}' is fenced (simulated failure)")
+        if node_id in self._unreachable_nodes:
+            raise ConnectionError(
+                f"Node '{node_id}' is unreachable: {self._errors.get(node_id, 'Connection refused')}"
+            )
 
     def check_node_connectivity(self, node_id: str) -> NodeReachability:
         if node_id not in self._configs:
@@ -231,33 +306,71 @@ class InMemoryStorageAdapter(StorageAdapter):
         )
 
     def put_object(self, node_id: str, key: str, data: bytes, bucket: str = "objects") -> None:
-        if node_id not in self._configs:
-            raise KeyError(f"Unknown node ID: {node_id}")
-        if self.is_fenced(node_id):
-            raise ConnectionError(f"Node '{node_id}' is fenced (simulated failure)")
-        if node_id in self._unreachable_nodes:
-            raise ConnectionError(f"Node '{node_id}' is unreachable: {self._errors.get(node_id, 'Connection refused')}")
+        self._check_available(node_id)
         if node_id not in self._storage:
             self._storage[node_id] = {}
         self._storage[node_id][key] = data
 
     def get_object(self, node_id: str, key: str, bucket: str = "objects") -> bytes:
-        if node_id not in self._configs:
-            raise KeyError(f"Unknown node ID: {node_id}")
-        if self.is_fenced(node_id):
-            raise ConnectionError(f"Node '{node_id}' is fenced (simulated failure)")
-        if node_id in self._unreachable_nodes:
-            raise ConnectionError(f"Node '{node_id}' is unreachable: {self._errors.get(node_id, 'Connection refused')}")
+        self._check_available(node_id)
         if node_id not in self._storage or key not in self._storage[node_id]:
             raise KeyError(f"Object '{key}' not found on node '{node_id}'")
         return self._storage[node_id][key]
 
     def delete_object(self, node_id: str, key: str, bucket: str = "objects") -> None:
-        if node_id not in self._configs:
-            raise KeyError(f"Unknown node ID: {node_id}")
-        if self.is_fenced(node_id):
-            raise ConnectionError(f"Node '{node_id}' is fenced (simulated failure)")
-        if node_id in self._unreachable_nodes:
-            raise ConnectionError(f"Node '{node_id}' is unreachable: {self._errors.get(node_id, 'Connection refused')}")
+        self._check_available(node_id)
         if node_id in self._storage:
             self._storage[node_id].pop(key, None)
+
+    def stream_sha256(self, node_id: str, key: str, bucket: str = "objects") -> str:
+        """Streams the object in 1 MiB chunks and returns its SHA-256 hex digest."""
+        self._check_available(node_id)
+        data = self.get_object(node_id, key, bucket=bucket)
+        h = hashlib.sha256()
+        stream = io.BytesIO(data)
+        while True:
+            chunk = stream.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            h.update(chunk)
+        return h.hexdigest()
+
+    def copy_object(
+        self,
+        source_node_id: str,
+        target_node_id: str,
+        key: str,
+        bucket: str = "objects",
+    ) -> int:
+        """Copies key from source to target in 1 MiB chunks. Returns bytes_copied.
+
+        Raises if either node is fenced or unreachable. Source is never modified.
+        If fail_after_bytes is set on the target, raises mid-copy without committing.
+        """
+        self._check_available(source_node_id)
+        self._check_available(target_node_id)
+
+        source_data = self.get_object(source_node_id, key, bucket=bucket)
+
+        fail_at = self._fail_after_bytes.get(target_node_id)
+        stream = io.BytesIO(source_data)
+        chunks = []
+        bytes_copied = 0
+
+        while True:
+            chunk = stream.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            if fail_at is not None and bytes_copied + len(chunk) > fail_at:
+                # Simulate mid-copy failure — do NOT commit anything to target
+                raise ConnectionError(
+                    f"Node '{target_node_id}' failed after {fail_at} bytes (test hook)"
+                )
+            chunks.append(chunk)
+            bytes_copied += len(chunk)
+
+        # Only commit once all chunks are collected successfully
+        if target_node_id not in self._storage:
+            self._storage[target_node_id] = {}
+        self._storage[target_node_id][key] = b"".join(chunks)
+        return bytes_copied
