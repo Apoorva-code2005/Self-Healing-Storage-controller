@@ -104,20 +104,29 @@ CREATE TABLE IF NOT EXISTS scenarios (
 MIGRATION_V3 = """
 CREATE TABLE IF NOT EXISTS migration_jobs (
     job_id TEXT PRIMARY KEY,
+    job_type TEXT NOT NULL DEFAULT 'evacuate',
     object_id TEXT NOT NULL,
     source_node_id TEXT NOT NULL,
     target_node_id TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('queued','running','verifying','succeeded','failed','blocked')),
+    priority_score REAL NOT NULL DEFAULT 0.0,
+    status TEXT NOT NULL CHECK (status IN ('queued','running','verifying','succeeded','failed','blocked')),
     bytes_transferred INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT,
+    finished_at TEXT,
+    source_checksum TEXT,
+    target_checksum TEXT,
+    verification_result TEXT,
+    error_message TEXT,
     retries INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    backoff_log_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS object_leases (
     object_id TEXT PRIMARY KEY,
-    owner_job_id TEXT NOT NULL,
-    expiry TEXT NOT NULL
+    job_id TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    acquired_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
 );
 """
 
@@ -125,11 +134,6 @@ MIGRATIONS: Dict[int, str] = {
     1: MIGRATION_V1,
     2: MIGRATION_V2,
     3: MIGRATION_V3,
-}
-
-MIGRATIONS: Dict[int, str] = {
-    1: MIGRATION_V1,
-    2: MIGRATION_V2,
 }
 
 
