@@ -21,8 +21,14 @@ import logging
 from pathlib import Path
 import random
 import sqlite3
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
+
+# Ensure project root is in sys.path when running script directly
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.config import AppConfig, AppInfo, NodeConfig, PolicyConfig
 from app.db.connection import create_connection

@@ -7,8 +7,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 from typing import Any, Dict, Optional, Tuple
 import joblib
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
