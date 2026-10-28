@@ -6,7 +6,9 @@ from datetime import datetime, timezone
 import email
 from email.policy import default as default_email_policy
 import hashlib
+import json
 import logging
+from pathlib import Path
 import sqlite3
 from typing import Any, Dict, Generator, List, Optional, Tuple
 import uuid
@@ -732,6 +734,45 @@ def create_app(
                 "w4_redundancy": w.w4_redundancy,
             },
             "items": page,
+        }
+
+    # ------------------------------------------------------------------
+    # GET /experiments  (Phase 8)
+    # ------------------------------------------------------------------
+    @application.get("/experiments")
+    def get_experiments(
+        recovery_mode: Optional[str] = Query(default=None, description="Filter by recovery mode"),
+        outcome: Optional[str] = Query(default=None, description="Filter by prediction outcome"),
+    ) -> Dict[str, Any]:
+        summary_path = Path("data/experiments_summary.json")
+        if not summary_path.is_file():
+            summary_path = Path(__file__).resolve().parent.parent / "data" / "experiments_summary.json"
+
+        if not summary_path.is_file():
+            return {
+                "total": 0,
+                "runs": [],
+                "summary": {},
+                "status": "no_experiments_recorded",
+            }
+
+        try:
+            with open(summary_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            log.warning("Failed to read %s: %s", summary_path, exc)
+            return {"total": 0, "runs": [], "summary": {}, "error": str(exc)}
+
+        runs = data.get("runs", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        if recovery_mode:
+            runs = [r for r in runs if r.get("recovery_mode") == recovery_mode]
+        if outcome:
+            runs = [r for r in runs if r.get("outcome") == outcome or r.get("prediction_outcome") == outcome]
+
+        return {
+            "total": len(runs),
+            "runs": runs,
+            "summary": data.get("summary", {}) if isinstance(data, dict) else {},
         }
 
     return application
